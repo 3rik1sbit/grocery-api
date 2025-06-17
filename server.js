@@ -122,6 +122,42 @@ app.post('/groceries', async (req, res) => {
     }
 });
 
+/**
+ * @route   DELETE /groceries/:id
+ * @desc    Delete a grocery item.
+ * @access  Public
+ */
+app.delete('/groceries/:id', async (req, res) => {
+    const itemId = parseInt(req.params.id, 10);
+    console.log(`DELETE /groceries/${itemId} - Request received to delete item.`);
+
+    if (isNaN(itemId)) {
+        return res.status(400).json({ message: 'Invalid item ID provided.' });
+    }
+
+    try {
+        let db = await readDatabase();
+        const initialLength = db.groceries.length;
+
+        // Filter out the item to be deleted
+        db.groceries = db.groceries.filter(item => item.id !== itemId);
+
+        if (db.groceries.length === initialLength) {
+            console.warn(`Item with ID ${itemId} not found for deletion.`);
+            return res.status(404).json({ message: 'Item not found.' });
+        }
+
+        await writeDatabase(db);
+
+        console.log(`Successfully deleted item ID ${itemId}.`);
+        // Send a 204 No Content response, which is standard for a successful DELETE.
+        res.status(204).send();
+
+    } catch (error) {
+        console.error(`Error deleting item ${itemId}:`, error);
+        res.status(500).json({ message: 'Error updating database.' });
+    }
+});
 
 // --- Server Initialization ---
 app.listen(PORT, () => {
