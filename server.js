@@ -75,6 +75,22 @@ app.post('/lists', async (req, res) => {
 });
 
 
+app.delete('/lists/:listId', async (req, res) => {
+    const listId = parseInt(req.params.listId, 10);
+    console.log(`DELETE /lists/${listId} - Request to delete list.`);
+    try {
+        const db = await readDatabase();
+        const initialLength = db.lists.length;
+        db.lists = db.lists.filter(l => l.id !== listId);
+        if (db.lists.length === initialLength) return res.status(404).json({ message: 'List not found.' });
+        await writeDatabase(db);
+        res.status(204).send();
+    } catch (error) {
+        console.error('Error deleting list:', error);
+        res.status(500).json({ message: 'Error updating database.' });
+    }
+});
+
 // --- API Routes for Groceries (Items within a list) ---
 
 // GET items is updated to sort by position
