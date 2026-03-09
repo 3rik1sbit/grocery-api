@@ -18,7 +18,14 @@ app.use(express.json());
 async function readDatabase() {
     try {
         const data = await fs.readFile(DB_PATH, 'utf8');
-        return JSON.parse(data);
+        const db = JSON.parse(data);
+        // Migrate existing lists that lack changeCount
+        for (const list of db.lists) {
+            if (list.changeCount === undefined) {
+                list.changeCount = 0;
+            }
+        }
+        return db;
     } catch (error) {
         if (error.code === 'ENOENT') {
             const initialData = { lists: [{ id: 1, name: "Småhandling", items: [] }] };
@@ -40,7 +47,7 @@ app.get('/lists', async (req, res) => {
     console.log('GET /lists - Request received to fetch all lists.');
     try {
         const db = await readDatabase();
-        const listMetas = db.lists.map(list => ({ id: list.id, name: list.name }));
+        const listMetas = db.lists.map(list => ({ id: list.id, name: list.name, changeCount: list.changeCount || 0 }));
         res.status(200).json(listMetas);
     } catch (error) {
         console.error('Error fetching lists:', error);
@@ -56,7 +63,7 @@ app.post('/lists', async (req, res) => {
     try {
         const db = await readDatabase();
         const newId = db.lists.length > 0 ? Math.max(...db.lists.map(l => l.id)) + 1 : 1;
-        const newList = { id: newId, name: name.trim(), items: [] };
+        const newList = { id: newId, name: name.trim(), items: [], changeCount: 0 };
         db.lists.push(newList);
         await writeDatabase(db);
         console.log("Successfully created new list:", newList);
@@ -98,6 +105,7 @@ app.post('/lists/:listId/groceries', async (req, res) => {
         
         const newItem = { id: newItemId, name: name.trim(), checked: false, position: newPosition };
         list.items.push(newItem);
+        list.changeCount = (list.changeCount || 0) + 1;
         await writeDatabase(db);
         res.status(201).json(newItem);
     } catch (error) { res.status(500).json({ message: 'Error updating database.' }); }
@@ -129,6 +137,7 @@ app.post('/lists/:listId/groceries/reorder', async (req, res) => {
             }
         });
         
+        list.changeCount = (list.changeCount || 0) + 1;
         await writeDatabase(db);
         res.status(200).json({ message: "List reordered successfully." });
     } catch (error) {
@@ -149,6 +158,7 @@ app.post('/lists/:listId/groceries/:itemId/toggle', async (req, res) => {
         const item = list.items.find(i => i.id === itemId);
         if (!item) return res.status(404).json({ message: 'Item not found.' });
         item.checked = !item.checked;
+        list.changeCount = (list.changeCount || 0) + 1;
         await writeDatabase(db);
         res.status(200).json(item);
     } catch (error) { res.status(500).json({ message: 'Error updating database.' }); }
@@ -163,6 +173,7 @@ app.delete('/lists/:listId/groceries/:itemId', async (req, res) => {
         const initialLength = list.items.length;
         list.items = list.items.filter(i => i.id !== itemId);
         if (list.items.length === initialLength) return res.status(404).json({ message: 'Item not found in list.' });
+        list.changeCount = (list.changeCount || 0) + 1;
         await writeDatabase(db);
         res.status(204).send();
     } catch (error) { res.status(500).json({ message: 'Error updating database.' }); }
