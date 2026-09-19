@@ -5,14 +5,50 @@ const express = require('express');
 const fs = require('fs').promises;
 const path = require('path');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = 3000;
 const DB_PATH = path.join(__dirname, 'database.json');
 
+// Pick up GROCERY_API_KEY from a local .env (gitignored) if there is one, so
+// the key doesn't have to be threaded through the pm2 invocation.
+try {
+    process.loadEnvFile(path.join(__dirname, '.env'));
+} catch {
+    // No .env file; fall back to the real environment.
+}
+
+const API_KEY = process.env.GROCERY_API_KEY;
+if (!API_KEY) {
+    console.error(
+        'GROCERY_API_KEY is not set. Refusing to start: that would expose every ' +
+        'list to anyone who finds this URL. Put it in backend/.env or the environment.'
+    );
+    process.exit(1);
+}
+
 // --- Middleware ---
 app.use(cors());
 app.use(express.json());
+
+// Every route below requires the shared key. Compared in constant time so the
+// endpoint can't be used as an oracle to recover the key byte by byte.
+function keyMatches(presented) {
+    const a = Buffer.from(presented, 'utf8');
+    const b = Buffer.from(API_KEY, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+
+app.use((req, res, next) => {
+    const presented = req.get('X-API-Key');
+    if (!presented || !keyMatches(presented)) {
+        console.warn(`Rejected unauthenticated ${req.method} ${req.path}`);
+        return res.status(401).json({ message: 'Unauthorized.' });
+    }
+    next();
+});
 
 // --- Helper Functions ---
 async function readDatabase() {
@@ -36,8 +72,40 @@ async function readDatabase() {
     }
 }
 
+// Writing straight over database.json means a crash mid-write leaves a
+// truncated file and the whole database is gone. Write a temp file in the same
+// directory, flush it, then rename: rename is atomic on POSIX, so a reader
+// either sees the old file or the complete new one, never a partial write.
 async function writeDatabase(data) {
-    await fs.writeFile(DB_PATH, JSON.stringify(data, null, 2), 'utf8');
+    const payload = JSON.stringify(data, null, 2);
+    const tmpPath = `${DB_PATH}.${process.pid}.tmp`;
+
+    let handle;
+    try {
+        handle = await fs.open(tmpPath, 'w');
+        await handle.writeFile(payload, 'utf8');
+        await handle.sync();
+    } finally {
+        if (handle) await handle.close();
+    }
+
+    try {
+        await fs.rename(tmpPath, DB_PATH);
+    } catch (error) {
+        await fs.unlink(tmpPath).catch(() => {});
+        throw error;
+    }
+
+    // Persist the rename itself, so the swap survives a power loss too.
+    let dir;
+    try {
+        dir = await fs.open(path.dirname(DB_PATH), 'r');
+        await dir.sync();
+    } catch {
+        // Directory fsync is a durability nicety; not all filesystems allow it.
+    } finally {
+        if (dir) await dir.close();
+    }
 }
 
 
