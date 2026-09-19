@@ -97,9 +97,13 @@ async function readDatabase() {
 // truncated file and the whole database is gone. Write a temp file in the same
 // directory, flush it, then rename: rename is atomic on POSIX, so a reader
 // either sees the old file or the complete new one, never a partial write.
+let tmpSeq = 0;
+
 async function writeDatabase(data) {
     const payload = JSON.stringify(data, null, 2);
-    const tmpPath = `${DB_PATH}.${process.pid}.tmp`;
+    // Unique per write: a fixed name meant two overlapping writes shared one
+    // temp file and both renamed it over the database.
+    const tmpPath = `${DB_PATH}.${process.pid}.${tmpSeq++}.tmp`;
 
     let handle;
     try {
@@ -129,6 +133,52 @@ async function writeDatabase(data) {
     }
 }
 
+// An error that carries the status the client should see, so a mutation can
+// bail out from inside updateDatabase without writing anything.
+class ApiError extends Error {
+    constructor(status, message) {
+        super(message);
+        this.status = status;
+    }
+}
+
+// Every request read the whole database, changed it, and wrote it back. Two
+// overlapping requests therefore both read the same snapshot and the second
+// write silently discarded the first one's change: two phones ticking off
+// different items at the same time, and one tick is simply lost. Serialising
+// the read-modify-write sequences makes each one see the previous one's result.
+//
+// An in-process queue is enough because pm2 runs this in fork_mode, as a single
+// process. Running it clustered, or as several processes over the same file,
+// would need a real file lock instead.
+let writeQueue = Promise.resolve();
+
+function serialize(task) {
+    const run = writeQueue.then(task, task);
+    // Keep the chain alive: a rejected task must not wedge every later one.
+    writeQueue = run.then(() => {}, () => {});
+    return run;
+}
+
+// Reads the database, applies `mutate`, and writes the result back, with no
+// other mutation interleaved. If `mutate` throws, nothing is written.
+async function updateDatabase(mutate) {
+    return serialize(async () => {
+        const db = await readDatabase();
+        const result = await mutate(db);
+        await writeDatabase(db);
+        return result;
+    });
+}
+
+function handleError(res, error, fallback) {
+    if (error instanceof ApiError) {
+        return res.status(error.status).json({ message: error.message });
+    }
+    console.error(fallback, error);
+    return res.status(500).json({ message: fallback });
+}
+
 
 // --- API Routes for Lists ---
 // ... (Your GET /lists and POST /lists routes remain the same) ...
@@ -150,16 +200,16 @@ app.post('/lists', async (req, res) => {
         return res.status(400).json({ message: 'List name is required.' });
     }
     try {
-        const db = await readDatabase();
-        const newId = db.lists.length > 0 ? Math.max(...db.lists.map(l => l.id)) + 1 : 1;
-        const newList = { id: newId, name: name.trim(), items: [], changeCount: 0 };
-        db.lists.push(newList);
-        await writeDatabase(db);
+        const newList = await updateDatabase(db => {
+            const newId = db.lists.length > 0 ? Math.max(...db.lists.map(l => l.id)) + 1 : 1;
+            const list = { id: newId, name: name.trim(), items: [], changeCount: 0 };
+            db.lists.push(list);
+            return list;
+        });
         console.log("Successfully created new list:", newList);
         res.status(201).json(newList);
     } catch (error) {
-        console.error('Error creating list:', error);
-        res.status(500).json({ message: 'Error updating database.' });
+        handleError(res, error, 'Error updating database.');
     }
 });
 
@@ -168,15 +218,14 @@ app.delete('/lists/:listId', async (req, res) => {
     const listId = parseInt(req.params.listId, 10);
     console.log(`DELETE /lists/${listId} - Request to delete list.`);
     try {
-        const db = await readDatabase();
-        const initialLength = db.lists.length;
-        db.lists = db.lists.filter(l => l.id !== listId);
-        if (db.lists.length === initialLength) return res.status(404).json({ message: 'List not found.' });
-        await writeDatabase(db);
+        await updateDatabase(db => {
+            const initialLength = db.lists.length;
+            db.lists = db.lists.filter(l => l.id !== listId);
+            if (db.lists.length === initialLength) throw new ApiError(404, 'List not found.');
+        });
         res.status(204).send();
     } catch (error) {
-        console.error('Error deleting list:', error);
-        res.status(500).json({ message: 'Error updating database.' });
+        handleError(res, error, 'Error updating database.');
     }
 });
 
@@ -199,21 +248,26 @@ app.get('/lists/:listId/groceries', async (req, res) => {
 app.post('/lists/:listId/groceries', async (req, res) => {
     const listId = parseInt(req.params.listId, 10);
     const { name } = req.body;
+    // Without this, a missing name threw on name.trim() and surfaced as a 500.
+    if (!name || typeof name !== 'string' || name.trim() === '') {
+        return res.status(400).json({ message: 'Item name is required.' });
+    }
     try {
-        const db = await readDatabase();
-        const list = db.lists.find(l => l.id === listId);
-        if (!list) return res.status(404).json({ message: 'List not found.' });
+        const newItem = await updateDatabase(db => {
+            const list = db.lists.find(l => l.id === listId);
+            if (!list) throw new ApiError(404, 'List not found.');
 
-        const newItemId = list.items.length > 0 ? Math.max(...list.items.map(item => item.id)) + 1 : 1;
-        // New items get the highest position, placing them at the end.
-        const newPosition = list.items.length > 0 ? Math.max(...list.items.map(item => item.position)) + 1 : 0;
-        
-        const newItem = { id: newItemId, name: name.trim(), checked: false, position: newPosition };
-        list.items.push(newItem);
-        list.changeCount = (list.changeCount || 0) + 1;
-        await writeDatabase(db);
+            const newItemId = list.items.length > 0 ? Math.max(...list.items.map(item => item.id)) + 1 : 1;
+            // New items get the highest position, placing them at the end.
+            const newPosition = list.items.length > 0 ? Math.max(...list.items.map(item => item.position)) + 1 : 0;
+
+            const item = { id: newItemId, name: name.trim(), checked: false, position: newPosition };
+            list.items.push(item);
+            list.changeCount = (list.changeCount || 0) + 1;
+            return item;
+        });
         res.status(201).json(newItem);
-    } catch (error) { res.status(500).json({ message: 'Error updating database.' }); }
+    } catch (error) { handleError(res, error, 'Error updating database.'); }
 });
 
 // *** NEW ENDPOINT FOR REORDERING ***
@@ -227,27 +281,26 @@ app.post('/lists/:listId/groceries/reorder', async (req, res) => {
     }
 
     try {
-        const db = await readDatabase();
-        const list = db.lists.find(l => l.id === listId);
-        if (!list) return res.status(404).json({ message: 'List not found.' });
+        await updateDatabase(db => {
+            const list = db.lists.find(l => l.id === listId);
+            if (!list) throw new ApiError(404, 'List not found.');
 
-        // Create a map for quick lookups
-        const itemMap = new Map(list.items.map(item => [item.id, item]));
+            // Create a map for quick lookups
+            const itemMap = new Map(list.items.map(item => [item.id, item]));
 
-        // Update the position of each item based on its index in the orderedIds array.
-        orderedIds.forEach((id, index) => {
-            const item = itemMap.get(id);
-            if (item) {
-                item.position = index;
-            }
+            // Update the position of each item based on its index in the orderedIds array.
+            orderedIds.forEach((id, index) => {
+                const item = itemMap.get(id);
+                if (item) {
+                    item.position = index;
+                }
+            });
+
+            list.changeCount = (list.changeCount || 0) + 1;
         });
-        
-        list.changeCount = (list.changeCount || 0) + 1;
-        await writeDatabase(db);
         res.status(200).json({ message: "List reordered successfully." });
     } catch (error) {
-        console.error(`Error reordering list ${listId}:`, error);
-        res.status(500).json({ message: 'Error updating database.' });
+        handleError(res, error, 'Error updating database.');
     }
 });
 
@@ -257,31 +310,32 @@ app.post('/lists/:listId/groceries/:itemId/toggle', async (req, res) => {
     const listId = parseInt(req.params.listId, 10);
     const itemId = parseInt(req.params.itemId, 10);
     try {
-        const db = await readDatabase();
-        const list = db.lists.find(l => l.id === listId);
-        if (!list) return res.status(404).json({ message: 'List not found.' });
-        const item = list.items.find(i => i.id === itemId);
-        if (!item) return res.status(404).json({ message: 'Item not found.' });
-        item.checked = !item.checked;
-        list.changeCount = (list.changeCount || 0) + 1;
-        await writeDatabase(db);
-        res.status(200).json(item);
-    } catch (error) { res.status(500).json({ message: 'Error updating database.' }); }
+        const toggled = await updateDatabase(db => {
+            const list = db.lists.find(l => l.id === listId);
+            if (!list) throw new ApiError(404, 'List not found.');
+            const item = list.items.find(i => i.id === itemId);
+            if (!item) throw new ApiError(404, 'Item not found.');
+            item.checked = !item.checked;
+            list.changeCount = (list.changeCount || 0) + 1;
+            return item;
+        });
+        res.status(200).json(toggled);
+    } catch (error) { handleError(res, error, 'Error updating database.'); }
 });
 app.delete('/lists/:listId/groceries/:itemId', async (req, res) => {
     const listId = parseInt(req.params.listId, 10);
     const itemId = parseInt(req.params.itemId, 10);
     try {
-        const db = await readDatabase();
-        const list = db.lists.find(l => l.id === listId);
-        if (!list) return res.status(404).json({ message: 'List not found.' });
-        const initialLength = list.items.length;
-        list.items = list.items.filter(i => i.id !== itemId);
-        if (list.items.length === initialLength) return res.status(404).json({ message: 'Item not found in list.' });
-        list.changeCount = (list.changeCount || 0) + 1;
-        await writeDatabase(db);
+        await updateDatabase(db => {
+            const list = db.lists.find(l => l.id === listId);
+            if (!list) throw new ApiError(404, 'List not found.');
+            const initialLength = list.items.length;
+            list.items = list.items.filter(i => i.id !== itemId);
+            if (list.items.length === initialLength) throw new ApiError(404, 'Item not found in list.');
+            list.changeCount = (list.changeCount || 0) + 1;
+        });
         res.status(204).send();
-    } catch (error) { res.status(500).json({ message: 'Error updating database.' }); }
+    } catch (error) { handleError(res, error, 'Error updating database.'); }
 });
 
 
