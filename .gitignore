@@ -3,6 +3,9 @@
 
 # Data
 /database.json
+# ...and the copies server.js writes before it rewrites the file. They are
+# the same data with a timestamp, so they are ignored for the same reason.
+/database.json.bak-*
 
 # Logs
 *.log
