@@ -3,6 +3,7 @@
 
 const express = require('express');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -12,12 +13,32 @@ const PORT = 3000;
 const DB_PATH = path.join(__dirname, 'database.json');
 
 // Pick up GROCERY_API_KEY from a local .env (gitignored) if there is one, so
-// the key doesn't have to be threaded through the pm2 invocation.
-try {
-    process.loadEnvFile(path.join(__dirname, '.env'));
-} catch {
-    // No .env file; fall back to the real environment.
+// the key doesn't have to be threaded through the pm2 invocation. Parsed by
+// hand because process.loadEnvFile needs Node 20.6+ and production is on 18.
+function loadEnvFile(file) {
+    let contents;
+    try {
+        contents = fsSync.readFileSync(file, 'utf8');
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        return; // No .env; fall back to the real environment.
+    }
+    for (const line of contents.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) continue;
+        const key = trimmed.slice(0, eq).trim();
+        let value = trimmed.slice(eq + 1).trim();
+        const quoted = (value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"));
+        if (quoted) value = value.slice(1, -1);
+        // A real environment variable wins over the file.
+        if (!(key in process.env)) process.env[key] = value;
+    }
 }
+
+loadEnvFile(path.join(__dirname, '.env'));
 
 const API_KEY = process.env.GROCERY_API_KEY;
 if (!API_KEY) {
