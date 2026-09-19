@@ -1,0 +1,26 @@
+[Unit]
+Description=Grocery API (ShoppingList backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grocery
+WorkingDirectory=/opt/grocery-api
+Environment=NODE_ENV=production
+Environment=PORT=3000
+# Outside the code directory, so redeploying the code cannot touch the list.
+Environment=DATABASE_PATH=/var/lib/grocery-api/database.json
+EnvironmentFile=/opt/grocery-api/.env
+ExecStart=/usr/bin/node /opt/grocery-api/server.js
+Restart=always
+RestartSec=3
+# It serves one JSON file over HTTP; it needs nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/grocery-api
+
+[Install]
+WantedBy=multi-user.target
