@@ -50,7 +50,15 @@ if (!API_KEY) {
 }
 
 // --- Middleware ---
-app.use(cors());
+// The Android client is not a browser, so it needs no CORS at all. Send
+// cross-origin permission only to origins named in CORS_ORIGINS (comma
+// separated); with none set, send none. Set that variable if a web client is
+// ever added.
+const corsOrigins = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+app.use(cors(corsOrigins.length > 0 ? { origin: corsOrigins } : { origin: false }));
 app.use(express.json());
 
 // Every route below requires the shared key. Compared in constant time so the
@@ -171,6 +179,28 @@ async function updateDatabase(mutate) {
     });
 }
 
+// Ids were max(existing) + 1, which restarts at 1 once everything is deleted
+// and hands a new row an id a client still has cached, so the client's stale
+// entry silently becomes the new one. Keep a high-water mark instead, seeded
+// from the existing rows so old databases carry over.
+function allocateListId(db) {
+    const highWater = db.lists.reduce(
+        (max, list) => Math.max(max, list.id),
+        db.nextListId || 0
+    );
+    db.nextListId = highWater + 1;
+    return db.nextListId;
+}
+
+function allocateItemId(list) {
+    const highWater = list.items.reduce(
+        (max, item) => Math.max(max, item.id),
+        list.nextItemId || 0
+    );
+    list.nextItemId = highWater + 1;
+    return list.nextItemId;
+}
+
 function handleError(res, error, fallback) {
     if (error instanceof ApiError) {
         return res.status(error.status).json({ message: error.message });
@@ -201,8 +231,8 @@ app.post('/lists', async (req, res) => {
     }
     try {
         const newList = await updateDatabase(db => {
-            const newId = db.lists.length > 0 ? Math.max(...db.lists.map(l => l.id)) + 1 : 1;
-            const list = { id: newId, name: name.trim(), items: [], changeCount: 0 };
+            const newId = allocateListId(db);
+            const list = { id: newId, name: name.trim(), items: [], changeCount: 0, nextItemId: 0 };
             db.lists.push(list);
             return list;
         });
@@ -257,9 +287,12 @@ app.post('/lists/:listId/groceries', async (req, res) => {
             const list = db.lists.find(l => l.id === listId);
             if (!list) throw new ApiError(404, 'List not found.');
 
-            const newItemId = list.items.length > 0 ? Math.max(...list.items.map(item => item.id)) + 1 : 1;
+            const newItemId = allocateItemId(list);
             // New items get the highest position, placing them at the end.
-            const newPosition = list.items.length > 0 ? Math.max(...list.items.map(item => item.position)) + 1 : 0;
+            const newPosition = list.items.reduce(
+                (max, item) => Math.max(max, item.position + 1),
+                0
+            );
 
             const item = { id: newItemId, name: name.trim(), checked: false, position: newPosition };
             list.items.push(item);
