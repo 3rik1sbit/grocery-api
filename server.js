@@ -9,8 +9,10 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
-const PORT = 3000;
-const DB_PATH = path.join(__dirname, 'database.json');
+// Overridable so the test suite can run against a scratch database on a free
+// port instead of the real one.
+const PORT = Number(process.env.PORT) || 3000;
+const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, 'database.json');
 
 // Pick up GROCERY_API_KEY from a local .env (gitignored) if there is one, so
 // the key doesn't have to be threaded through the pm2 invocation. Parsed by
@@ -244,6 +246,26 @@ app.post('/lists', async (req, res) => {
 });
 
 
+app.patch('/lists/:listId', async (req, res) => {
+    const listId = parseInt(req.params.listId, 10);
+    const { name } = req.body;
+    console.log(`PATCH /lists/${listId} - Request to rename list.`);
+    if (!name || typeof name !== 'string' || name.trim() === '') {
+        return res.status(400).json({ message: 'List name is required.' });
+    }
+    try {
+        const renamed = await updateDatabase(db => {
+            const list = db.lists.find(l => l.id === listId);
+            if (!list) throw new ApiError(404, 'List not found.');
+            list.name = name.trim();
+            return { id: list.id, name: list.name, changeCount: list.changeCount || 0 };
+        });
+        res.status(200).json(renamed);
+    } catch (error) {
+        handleError(res, error, 'Error updating database.');
+    }
+});
+
 app.delete('/lists/:listId', async (req, res) => {
     const listId = parseInt(req.params.listId, 10);
     console.log(`DELETE /lists/${listId} - Request to delete list.`);
@@ -355,6 +377,26 @@ app.post('/lists/:listId/groceries/:itemId/toggle', async (req, res) => {
         res.status(200).json(toggled);
     } catch (error) { handleError(res, error, 'Error updating database.'); }
 });
+// Registered before /:itemId, otherwise "completed" is parsed as an item id.
+app.delete('/lists/:listId/groceries/completed', async (req, res) => {
+    const listId = parseInt(req.params.listId, 10);
+    console.log(`DELETE /lists/${listId}/groceries/completed - Clearing checked items.`);
+    try {
+        const removed = await updateDatabase(db => {
+            const list = db.lists.find(l => l.id === listId);
+            if (!list) throw new ApiError(404, 'List not found.');
+            const before = list.items.length;
+            list.items = list.items.filter(item => !item.checked);
+            const count = before - list.items.length;
+            if (count > 0) list.changeCount = (list.changeCount || 0) + 1;
+            return count;
+        });
+        res.status(200).json({ removed });
+    } catch (error) {
+        handleError(res, error, 'Error updating database.');
+    }
+});
+
 app.delete('/lists/:listId/groceries/:itemId', async (req, res) => {
     const listId = parseInt(req.params.listId, 10);
     const itemId = parseInt(req.params.itemId, 10);
