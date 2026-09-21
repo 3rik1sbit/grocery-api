@@ -63,6 +63,30 @@ const corsOrigins = (process.env.CORS_ORIGINS || '')
 app.use(cors(corsOrigins.length > 0 ? { origin: corsOrigins } : { origin: false }));
 app.use(express.json());
 
+// --- Health ---
+// Deliberately above the key check. This is the one endpoint the uptime
+// monitor calls, and handing monitoring a copy of the production key so it
+// can ask "are you alive?" every minute is a worse trade than leaving this
+// open. It discloses nothing an anonymous caller could not already learn from
+// the port accepting connections -- no counts, no names, just the verdict.
+//
+// It reads the database rather than answering a flat 200, because a process
+// that is up while its database is missing or corrupt is precisely the state
+// worth being woken for, and `res.send('ok')` cannot tell the two apart.
+//
+// Read-only, and deliberately NOT readDatabase(): that helper writes a fresh
+// database when the file is missing, and an unauthenticated request must
+// never be able to create anything.
+app.get('/health', async (req, res) => {
+    try {
+        JSON.parse(await fs.readFile(DB_PATH, 'utf8'));
+        res.json({ status: 'ok' });
+    } catch (error) {
+        console.error(`Health check failed: ${error.message}`);
+        res.status(503).json({ status: 'unavailable' });
+    }
+});
+
 // Every route below requires the shared key. Compared in constant time so the
 // endpoint can't be used as an oracle to recover the key byte by byte.
 function keyMatches(presented) {

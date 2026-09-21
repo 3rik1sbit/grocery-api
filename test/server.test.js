@@ -81,6 +81,34 @@ test('every route rejects a request with no key, a wrong key, and accepts the ri
     assert.strictEqual((await req('GET', '/lists')).status, 200);
 });
 
+test('/health answers without a key, and discloses nothing but the verdict', async () => {
+    // Unauthenticated on purpose so monitoring needs no copy of the key --
+    // see the comment on the route. The exact body is asserted because the
+    // value of this endpoint is that it leaks nothing: no list names, no
+    // counts. A future "helpful" addition should fail here.
+    const res = await req('GET', '/health', { key: null });
+    assert.strictEqual(res.status, 200);
+    assert.deepStrictEqual(await res.json(), { status: 'ok' });
+});
+
+test('/health reports 503 when the database cannot be read', async () => {
+    // The whole reason it reads the file instead of answering a flat 200: an
+    // up process with an unreadable database must not look healthy.
+    fs.writeFileSync(dbPath, '{ not valid json');
+    const res = await req('GET', '/health', { key: null });
+    assert.strictEqual(res.status, 503);
+    assert.deepStrictEqual(await res.json(), { status: 'unavailable' });
+});
+
+test('/health does not create a database when one is missing', async () => {
+    // readDatabase() writes a starter database on ENOENT. If /health ever
+    // starts using it, an unauthenticated request could create files.
+    fs.rmSync(dbPath);
+    const res = await req('GET', '/health', { key: null });
+    assert.strictEqual(res.status, 503);
+    assert.strictEqual(fs.existsSync(dbPath), false);
+});
+
 test('a wrong key of the same length is still rejected', async () => {
     // Guards the constant-time comparison against being replaced by something
     // that only checks length.
