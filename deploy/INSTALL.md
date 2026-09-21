@@ -45,3 +45,19 @@ straight at port 3000.
     curl -s -o /dev/null -w '%{http_code}\n' https://grocery.ews-web.eu/lists   # 401
     curl -s -o /dev/null -w '%{http_code}\n' -H "X-API-Key: ..." \
          https://grocery.ews-web.eu/lists                                        # 200
+    curl -s https://grocery.ews-web.eu/health                          # {"status":"ok"}
+
+## /health
+
+The only route above the key check, and the only one that answers without a
+credential. It exists so the uptime monitor does not need a copy of the
+production key to ask whether this is alive; it discloses nothing beyond the
+verdict.
+
+It reads the database before answering, so `{"status":"ok"}` means the
+process is up *and* `DATABASE_PATH` is readable and parses. A 503 means the
+process is up and its data is not -- check that `DATABASE_PATH` in the unit
+still points at `/var/lib/grocery-api/database.json` and that `grocery` owns
+it.
+
+Monitored by `web_grocery` in `~/scripts/log_uptime.sh` on the host.
